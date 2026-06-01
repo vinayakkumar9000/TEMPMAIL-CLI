@@ -11,11 +11,14 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import json
 import logging
 import os
 import platform
 import random
+import signal
 import string
 import sys
 import time
@@ -39,6 +42,7 @@ clear_screen()
 try:
     import requests
     from rich.console import Console
+    from rich.live import Live
     from rich.logging import RichHandler
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -51,6 +55,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "rich"])
     import requests
     from rich.console import Console
+    from rich.live import Live
     from rich.logging import RichHandler
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -97,27 +102,54 @@ def ensure_config_dir() -> None:
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from file or return defaults."""
+    defaults = {
+        "default_provider": "mail.tm",
+        "poll_interval": 5,
+        "max_history_entries": 50,
+        "save_messages": True,
+        "display_mode": "rich",
+    }
+    
     if not CONFIG_FILE.exists():
-        return {
-            "default_provider": "mail.tm",
-            "poll_interval": 5,
-            "max_history_entries": 50,
-            "save_messages": True,
-            "display_mode": "rich",
-        }
+        return defaults.copy()
     
     try:
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+            config = json.load(f)
     except Exception as e:
         LOGGER.warning(f"Failed to load config: {e}. Using defaults.")
-        return {
-            "default_provider": "mail.tm",
-            "poll_interval": 5,
-            "max_history_entries": 50,
-            "save_messages": True,
-            "display_mode": "rich",
-        }
+        return defaults.copy()
+    
+    # Validate and fix config values
+    fixed = []
+    
+    # Validate poll_interval
+    if not isinstance(config.get("poll_interval"), int) or config.get("poll_interval", 0) < 1:
+        config["poll_interval"] = defaults["poll_interval"]
+        fixed.append("poll_interval")
+    
+    # Validate display_mode
+    if config.get("display_mode") not in ["rich", "plain"]:
+        config["display_mode"] = defaults["display_mode"]
+        fixed.append("display_mode")
+    
+    # Validate default_provider
+    valid_providers = ["guerrillamail", "mail.tm", "tempmail.lol", "mail.gw", "dropmail.me"]
+    if config.get("default_provider") not in valid_providers:
+        config["default_provider"] = defaults["default_provider"]
+        fixed.append("default_provider")
+    
+    # Validate max_history_entries
+    if not isinstance(config.get("max_history_entries"), int) or not (1 <= config.get("max_history_entries", 0) <= 500):
+        config["max_history_entries"] = defaults["max_history_entries"]
+        fixed.append("max_history_entries")
+    
+    # If any values were fixed, save the corrected config and warn user
+    if fixed:
+        console.print(f"[warning]Config values corrected: {', '.join(fixed)}[/]")
+        save_config(config)
+    
+    return config
 
 def save_config(config: Dict[str, Any]) -> None:
     """Save configuration to file."""
@@ -161,8 +193,61 @@ def save_message_to_history(provider: str, address: str, message: Dict[str, Any]
         LOGGER.warning(f"Failed to save message to history: {e}")
 
 ##############################################################################
+# Retry logic with exponential backoff
+##############################################################################
+
+def retry_with_backoff(max_retries: int = 3, base_delay: float = 2.0):
+    """
+    Decorator that retries a function with exponential backoff.
+    Retries on: requests.Timeout, requests.ConnectionError, requests.HTTPError (5xx only)
+    Wait times: 2s, 4s, 8s between retries
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.Timeout, requests.ConnectionError) as e:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        console.print(f"[dim]Retrying ({attempt + 1}/{max_retries})…[/dim]")
+                        time.sleep(delay)
+                    else:
+                        raise NetworkError(f"Failed after {max_retries} retries: {e}") from e
+                except requests.HTTPError as e:
+                    # Only retry on 5xx errors
+                    if e.response is not None and 500 <= e.response.status_code < 600:
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)
+                            console.print(f"[dim]Retrying ({attempt + 1}/{max_retries})…[/dim]")
+                            time.sleep(delay)
+                        else:
+                            raise NetworkError(f"Failed after {max_retries} retries: {e}") from e
+                    else:
+                        # Don't retry on 4xx errors
+                        raise
+        return wrapper
+    return decorator
+
+##############################################################################
 # Utility helpers
 ##############################################################################
+
+def _countdown_sleep(seconds: int, display_mode: str = "rich") -> None:
+    """Sleep with a live countdown indicator (only in rich mode)."""
+    if display_mode != "rich":
+        time.sleep(seconds)
+        return
+    
+    try:
+        with Live(console=console, refresh_per_second=1, transient=True) as live:
+            for remaining in range(seconds, 0, -1):
+                live.update(f"  ⏳ Next check in {remaining}s…")
+                time.sleep(1)
+    except Exception:
+        # Fallback to regular sleep if Live fails
+        time.sleep(seconds)
 
 def _rand_string(n: int = 10) -> str:
     """Generate a random alphanumeric string of length n."""
@@ -287,6 +372,31 @@ class APIError(ProviderError):
 # Provider 1 – GuerrillaMail
 ##############################################################################
 
+@retry_with_backoff()
+def _setup_guerrillamail(sess, GM_API, GM_UA):
+    """Setup GuerrillaMail account with retry logic."""
+    params = {"f": "get_email_address", "ip": "127.0.0.1", "agent": GM_UA}
+    res = sess.get(GM_API, params=params, timeout=15)
+    res.raise_for_status()
+    init = res.json()
+    return init["sid_token"], init["email_addr"]
+
+@retry_with_backoff()
+def _check_guerrillamail(sess, GM_API, sid):
+    """Check GuerrillaMail inbox with retry logic."""
+    params = {"f": "check_email", "sid_token": sid, "seq": 0}
+    box_res = sess.get(GM_API, params=params, timeout=15)
+    box_res.raise_for_status()
+    return box_res.json()
+
+@retry_with_backoff()
+def _fetch_guerrillamail(sess, GM_API, sid, mail_id):
+    """Fetch full GuerrillaMail message with retry logic."""
+    params = {"f": "fetch_email", "sid_token": sid, "email_id": mail_id}
+    full_res = sess.get(GM_API, params=params, timeout=15)
+    full_res.raise_for_status()
+    return full_res.json()
+
 def run_guerrillamail(poll: int = 5) -> None:
     """Run the GuerrillaMail provider listener."""
     GM_API = "https://api.guerrillamail.com/ajax.php"
@@ -304,14 +414,9 @@ def run_guerrillamail(poll: int = 5) -> None:
         progress.add_task("setup", total=None)
         
         try:
-            # Get address & sid token
-            params = {"f": "get_email_address", "ip": "127.0.0.1", "agent": GM_UA}
-            res = sess.get(GM_API, params=params, timeout=15)
-            res.raise_for_status()
-            init = res.json()
-            
-            sid = init["sid_token"]
-            address = init["email_addr"]
+            sid, address = _setup_guerrillamail(sess, GM_API, GM_UA)
+        except (NetworkError, APIError) as e:
+            raise
         except requests.RequestException as e:
             raise NetworkError(f"Network error: {e}") from e
         except Exception as e:
@@ -324,10 +429,7 @@ def run_guerrillamail(poll: int = 5) -> None:
     try:
         while True:
             try:
-                params = {"f": "check_email", "sid_token": sid, "seq": 0}
-                box_res = sess.get(GM_API, params=params, timeout=15)
-                box_res.raise_for_status()
-                box = box_res.json()
+                box = _check_guerrillamail(sess, GM_API, sid)
                 
                 for m in box.get("list", []):
                     if m["mail_id"] in seen:
@@ -335,10 +437,7 @@ def run_guerrillamail(poll: int = 5) -> None:
                     
                     seen.add(m["mail_id"])
                     
-                    params = {"f": "fetch_email", "sid_token": sid, "email_id": m["mail_id"]}
-                    full_res = sess.get(GM_API, params=params, timeout=15)
-                    full_res.raise_for_status()
-                    full = full_res.json()
+                    full = _fetch_guerrillamail(sess, GM_API, sid, m["mail_id"])
                     
                     print_email(
                         "guerrillamail",
@@ -349,18 +448,74 @@ def run_guerrillamail(poll: int = 5) -> None:
                         full.get("mail_body", ""),
                         full,
                     )
-            except requests.RequestException as e:
-                LOGGER.warning(f"Network error during polling: {e}")
+            except NetworkError as e:
+                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
             except Exception as e:
                 LOGGER.warning(f"Error during polling: {e}")
             
-            time.sleep(poll)
+            config = load_config()
+            _countdown_sleep(poll, config.get("display_mode", "rich"))
     except KeyboardInterrupt:
         console.print("[info]Stopped listening; goodbye![/]")
 
 ##############################################################################
 # Provider 2 – mail.tm
 ##############################################################################
+
+@retry_with_backoff()
+def _setup_mail_tm(BASE):
+    """Setup mail.tm account with retry logic."""
+    # Get available domains
+    domains_res = requests.get(f"{BASE}/domains?page=1", timeout=15)
+    domains_res.raise_for_status()
+    domain = domains_res.json()["hydra:member"][0]["domain"]
+    
+    # Create random account
+    address = f"{_rand_string()}@{domain}"
+    password = _rand_string(12)
+    
+    account_res = requests.post(
+        f"{BASE}/accounts", 
+        json={"address": address, "password": password},
+        timeout=15
+    )
+    account_res.raise_for_status()
+    
+    # Get authentication token
+    token_res = requests.post(
+        f"{BASE}/token", 
+        json={"address": address, "password": password},
+        timeout=15
+    )
+    token_res.raise_for_status()
+    auth = token_res.json()["token"]
+    
+    return address, password, auth
+
+@retry_with_backoff()
+def _authenticate_mail_tm(BASE, address, password):
+    """Re-authenticate with mail.tm (for token refresh)."""
+    token_res = requests.post(
+        f"{BASE}/token", 
+        json={"address": address, "password": password},
+        timeout=15
+    )
+    token_res.raise_for_status()
+    return token_res.json()["token"]
+
+@retry_with_backoff()
+def _check_mail_tm(BASE, headers):
+    """Check mail.tm inbox with retry logic."""
+    inbox_res = requests.get(f"{BASE}/messages", headers=headers, timeout=15)
+    inbox_res.raise_for_status()
+    return inbox_res.json()["hydra:member"]
+
+@retry_with_backoff()
+def _fetch_mail_tm(BASE, headers, message_id):
+    """Fetch full mail.tm message with retry logic."""
+    full_res = requests.get(f"{BASE}/messages/{message_id}", headers=headers, timeout=15)
+    full_res.raise_for_status()
+    return full_res.json()
 
 def run_mail_tm(poll: int = 5) -> None:
     """Run the mail.tm provider listener."""
@@ -375,32 +530,10 @@ def run_mail_tm(poll: int = 5) -> None:
         progress.add_task("setup", total=None)
         
         try:
-            # Get available domains
-            domains_res = requests.get(f"{BASE}/domains?page=1", timeout=15)
-            domains_res.raise_for_status()
-            domain = domains_res.json()["hydra:member"][0]["domain"]
-            
-            # Create random account
-            address = f"{_rand_string()}@{domain}"
-            password = _rand_string(12)
-            
-            account_res = requests.post(
-                f"{BASE}/accounts", 
-                json={"address": address, "password": password},
-                timeout=15
-            )
-            account_res.raise_for_status()
-            
-            # Get authentication token
-            token_res = requests.post(
-                f"{BASE}/token", 
-                json={"address": address, "password": password},
-                timeout=15
-            )
-            token_res.raise_for_status()
-            auth = token_res.json()["token"]
-            
+            address, password, auth = _setup_mail_tm(BASE)
             headers = {"Authorization": f"Bearer {auth}"}
+        except (NetworkError, APIError) as e:
+            raise
         except requests.RequestException as e:
             raise NetworkError(f"Network error: {e}") from e
         except Exception as e:
@@ -413,9 +546,7 @@ def run_mail_tm(poll: int = 5) -> None:
     try:
         while True:
             try:
-                inbox_res = requests.get(f"{BASE}/messages", headers=headers, timeout=15)
-                inbox_res.raise_for_status()
-                inbox = inbox_res.json()["hydra:member"]
+                inbox = _check_mail_tm(BASE, headers)
                 
                 for m in inbox:
                     if m["id"] in seen:
@@ -423,9 +554,7 @@ def run_mail_tm(poll: int = 5) -> None:
                     
                     seen.add(m["id"])
                     
-                    full_res = requests.get(f"{BASE}/messages/{m['id']}", headers=headers, timeout=15)
-                    full_res.raise_for_status()
-                    full = full_res.json()
+                    full = _fetch_mail_tm(BASE, headers, m["id"])
                     
                     print_email(
                         "mail.tm",
@@ -436,18 +565,46 @@ def run_mail_tm(poll: int = 5) -> None:
                         full.get("text", ""),
                         full,
                     )
-            except requests.RequestException as e:
-                LOGGER.warning(f"Network error during polling: {e}")
+            except requests.HTTPError as e:
+                # Handle 401 (token expired) - re-authenticate
+                if e.response is not None and e.response.status_code == 401:
+                    try:
+                        console.print("[info]Re-authenticated with mail.tm[/]")
+                        auth = _authenticate_mail_tm(BASE, address, password)
+                        headers = {"Authorization": f"Bearer {auth}"}
+                    except Exception as reauth_error:
+                        LOGGER.warning(f"Failed to re-authenticate: {reauth_error}")
+                else:
+                    LOGGER.warning(f"HTTP error during polling: {e}")
+            except NetworkError as e:
+                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
             except Exception as e:
                 LOGGER.warning(f"Error during polling: {e}")
             
-            time.sleep(poll)
+            config = load_config()
+            _countdown_sleep(poll, config.get("display_mode", "rich"))
     except KeyboardInterrupt:
         console.print("[info]Stopped listening; goodbye![/]")
 
 ##############################################################################
 # Provider 3 – tempmail.lol
 ##############################################################################
+
+@retry_with_backoff()
+def _setup_tempmail_lol(BASE, rush):
+    """Setup tempmail.lol account with retry logic."""
+    endpoint = f"{BASE}/generate/rush" if rush else f"{BASE}/generate"
+    gen_res = requests.get(endpoint, timeout=15)
+    gen_res.raise_for_status()
+    data = gen_res.json()
+    return data["address"], data["token"]
+
+@retry_with_backoff()
+def _check_tempmail_lol(BASE, token):
+    """Check tempmail.lol inbox with retry logic."""
+    inbox_res = requests.get(f"{BASE}/auth/{token}", timeout=15)
+    inbox_res.raise_for_status()
+    return inbox_res.json().get("email", [])
 
 def run_tempmail_lol(poll: int = 5, rush: bool = False) -> None:
     """Run the tempmail.lol provider listener."""
@@ -462,14 +619,9 @@ def run_tempmail_lol(poll: int = 5, rush: bool = False) -> None:
         progress.add_task("setup", total=None)
         
         try:
-            # Get address (optionally use rush endpoint)
-            endpoint = f"{BASE}/generate/rush" if rush else f"{BASE}/generate"
-            gen_res = requests.get(endpoint, timeout=15)
-            gen_res.raise_for_status()
-            
-            data = gen_res.json()
-            address = data["address"]
-            token = data["token"]
+            address, token = _setup_tempmail_lol(BASE, rush)
+        except (NetworkError, APIError) as e:
+            raise
         except requests.RequestException as e:
             raise NetworkError(f"Network error: {e}") from e
         except Exception as e:
@@ -482,14 +634,12 @@ def run_tempmail_lol(poll: int = 5, rush: bool = False) -> None:
     try:
         while True:
             try:
-                inbox_res = requests.get(f"{BASE}/auth/{token}", timeout=15)
-                inbox_res.raise_for_status()
-                
-                msgs = inbox_res.json().get("email", [])
+                msgs = _check_tempmail_lol(BASE, token)
                 
                 for m in msgs:
-                    # Create a message ID from content to track seen messages
-                    msg_id = f"{m.get('from')}_{m.get('subject')}_{len(m.get('body', ''))}"
+                    # Create a message ID using SHA256 hash for better deduplication
+                    msg_content = f"{m.get('from', '')}{m.get('subject', '')}{m.get('body', '')}"
+                    msg_id = hashlib.sha256(msg_content.encode()).hexdigest()[:16]
                     
                     if msg_id in seen:
                         continue
@@ -505,18 +655,74 @@ def run_tempmail_lol(poll: int = 5, rush: bool = False) -> None:
                         m.get("body", ""),
                         m,
                     )
-            except requests.RequestException as e:
-                LOGGER.warning(f"Network error during polling: {e}")
+            except NetworkError as e:
+                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
             except Exception as e:
                 LOGGER.warning(f"Error during polling: {e}")
             
-            time.sleep(poll)
+            config = load_config()
+            _countdown_sleep(poll, config.get("display_mode", "rich"))
     except KeyboardInterrupt:
         console.print("[info]Stopped listening; goodbye![/]")
 
 ##############################################################################
 # Provider 4 – mail.gw (identical API to mail.tm, hosted elsewhere)
 ##############################################################################
+
+@retry_with_backoff()
+def _setup_mail_gw(BASE):
+    """Setup mail.gw account with retry logic."""
+    # Get available domains
+    domains_res = requests.get(f"{BASE}/domains?page=1", timeout=15)
+    domains_res.raise_for_status()
+    domain = domains_res.json()["hydra:member"][0]["domain"]
+    
+    # Create random account
+    address = f"{_rand_string()}@{domain}"
+    password = _rand_string(12)
+    
+    account_res = requests.post(
+        f"{BASE}/accounts", 
+        json={"address": address, "password": password},
+        timeout=15
+    )
+    account_res.raise_for_status()
+    
+    # Get authentication token
+    token_res = requests.post(
+        f"{BASE}/token", 
+        json={"address": address, "password": password},
+        timeout=15
+    )
+    token_res.raise_for_status()
+    auth = token_res.json()["token"]
+    
+    return address, password, auth
+
+@retry_with_backoff()
+def _authenticate_mail_gw(BASE, address, password):
+    """Re-authenticate with mail.gw (for token refresh)."""
+    token_res = requests.post(
+        f"{BASE}/token", 
+        json={"address": address, "password": password},
+        timeout=15
+    )
+    token_res.raise_for_status()
+    return token_res.json()["token"]
+
+@retry_with_backoff()
+def _check_mail_gw(BASE, headers):
+    """Check mail.gw inbox with retry logic."""
+    inbox_res = requests.get(f"{BASE}/messages", headers=headers, timeout=15)
+    inbox_res.raise_for_status()
+    return inbox_res.json()["hydra:member"]
+
+@retry_with_backoff()
+def _fetch_mail_gw(BASE, headers, message_id):
+    """Fetch full mail.gw message with retry logic."""
+    full_res = requests.get(f"{BASE}/messages/{message_id}", headers=headers, timeout=15)
+    full_res.raise_for_status()
+    return full_res.json()
 
 def run_mail_gw(poll: int = 5) -> None:
     """Run the mail.gw provider listener."""
@@ -531,32 +737,10 @@ def run_mail_gw(poll: int = 5) -> None:
         progress.add_task("setup", total=None)
         
         try:
-            # Get available domains
-            domains_res = requests.get(f"{BASE}/domains?page=1", timeout=15)
-            domains_res.raise_for_status()
-            domain = domains_res.json()["hydra:member"][0]["domain"]
-            
-            # Create random account
-            address = f"{_rand_string()}@{domain}"
-            password = _rand_string(12)
-            
-            account_res = requests.post(
-                f"{BASE}/accounts", 
-                json={"address": address, "password": password},
-                timeout=15
-            )
-            account_res.raise_for_status()
-            
-            # Get authentication token
-            token_res = requests.post(
-                f"{BASE}/token", 
-                json={"address": address, "password": password},
-                timeout=15
-            )
-            token_res.raise_for_status()
-            auth = token_res.json()["token"]
-            
+            address, password, auth = _setup_mail_gw(BASE)
             headers = {"Authorization": f"Bearer {auth}"}
+        except (NetworkError, APIError) as e:
+            raise
         except requests.RequestException as e:
             raise NetworkError(f"Network error: {e}") from e
         except Exception as e:
@@ -569,9 +753,7 @@ def run_mail_gw(poll: int = 5) -> None:
     try:
         while True:
             try:
-                inbox_res = requests.get(f"{BASE}/messages", headers=headers, timeout=15)
-                inbox_res.raise_for_status()
-                inbox = inbox_res.json()["hydra:member"]
+                inbox = _check_mail_gw(BASE, headers)
                 
                 for m in inbox:
                     if m["id"] in seen:
@@ -579,9 +761,7 @@ def run_mail_gw(poll: int = 5) -> None:
                     
                     seen.add(m["id"])
                     
-                    full_res = requests.get(f"{BASE}/messages/{m['id']}", headers=headers, timeout=15)
-                    full_res.raise_for_status()
-                    full = full_res.json()
+                    full = _fetch_mail_gw(BASE, headers, m["id"])
                     
                     print_email(
                         "mail.gw",
@@ -592,18 +772,96 @@ def run_mail_gw(poll: int = 5) -> None:
                         full.get("text", ""),
                         full,
                     )
-            except requests.RequestException as e:
-                LOGGER.warning(f"Network error during polling: {e}")
+            except requests.HTTPError as e:
+                # Handle 401 (token expired) - re-authenticate
+                if e.response is not None and e.response.status_code == 401:
+                    try:
+                        console.print("[info]Re-authenticated with mail.gw[/]")
+                        auth = _authenticate_mail_gw(BASE, address, password)
+                        headers = {"Authorization": f"Bearer {auth}"}
+                    except Exception as reauth_error:
+                        LOGGER.warning(f"Failed to re-authenticate: {reauth_error}")
+                else:
+                    LOGGER.warning(f"HTTP error during polling: {e}")
+            except NetworkError as e:
+                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
             except Exception as e:
                 LOGGER.warning(f"Error during polling: {e}")
             
-            time.sleep(poll)
+            config = load_config()
+            _countdown_sleep(poll, config.get("display_mode", "rich"))
     except KeyboardInterrupt:
         console.print("[info]Stopped listening; goodbye![/]")
 
 ##############################################################################
 # Provider 5 – dropmail.me
 ##############################################################################
+
+@retry_with_backoff()
+def _setup_dropmail_me(BASE, token):
+    """Setup dropmail.me account with retry logic."""
+    query = """
+    mutation {
+      introduceSession {
+        id
+        expiresAt
+        addresses {
+          address
+        }
+      }
+    }
+    """
+    
+    res = requests.post(
+        f"{BASE}/{token}",
+        json={"query": query},
+        headers={"Content-Type": "application/json"},
+        timeout=15
+    )
+    res.raise_for_status()
+    
+    data = res.json().get("data", {})
+    session = data.get("introduceSession", {})
+    session_id = session.get("id")
+    address = session.get("addresses", [{}])[0].get("address")
+    
+    if not session_id or not address:
+        raise APIError("Failed to get valid session or address")
+    
+    return session_id, address
+
+@retry_with_backoff()
+def _check_dropmail_me(BASE, token, session_id):
+    """Check dropmail.me inbox with retry logic."""
+    query = """
+    query($id: ID!){
+      session(id: $id){
+        mails{
+          id
+          fromAddr
+          headerSubject
+          text
+          receivedAt
+        }
+      }
+    }
+    """
+    
+    res = requests.post(
+        f"{BASE}/{token}",
+        json={"query": query, "variables": {"id": session_id}},
+        headers={"Content-Type": "application/json"},
+        timeout=15
+    )
+    res.raise_for_status()
+    
+    data = res.json().get("data", {})
+    session_data = data.get("session", {})
+    
+    if not session_data:
+        raise APIError("Session expired or not found")
+    
+    return session_data.get("mails", [])
 
 def run_dropmail_me(poll: int = 5) -> None:
     """Run the dropmail.me provider listener."""
@@ -618,35 +876,10 @@ def run_dropmail_me(poll: int = 5) -> None:
         progress.add_task("setup", total=None)
         
         try:
-            # Create a new session with a random token
             token = _rand_string(12)
-            query = """
-            mutation {
-              introduceSession {
-                id
-                expiresAt
-                addresses {
-                  address
-                }
-              }
-            }
-            """
-            
-            res = requests.post(
-                f"{BASE}/{token}",
-                json={"query": query},
-                headers={"Content-Type": "application/json"},
-                timeout=15
-            )
-            res.raise_for_status()
-            
-            data = res.json().get("data", {})
-            session = data.get("introduceSession", {})
-            session_id = session.get("id")
-            address = session.get("addresses", [{}])[0].get("address")
-            
-            if not session_id or not address:
-                raise APIError("Failed to get valid session or address")
+            session_id, address = _setup_dropmail_me(BASE, token)
+        except (NetworkError, APIError) as e:
+            raise
         except requests.RequestException as e:
             raise NetworkError(f"Network error: {e}") from e
         except Exception as e:
@@ -657,38 +890,9 @@ def run_dropmail_me(poll: int = 5) -> None:
     
     seen: Set[str] = set()
     try:
-        query = """
-        query($id: ID!){
-          session(id: $id){
-            mails{
-              id
-              fromAddr
-              headerSubject
-              text
-              receivedAt
-            }
-          }
-        }
-        """
-        
         while True:
             try:
-                res = requests.post(
-                    f"{BASE}/{token}",
-                    json={"query": query, "variables": {"id": session_id}},
-                    headers={"Content-Type": "application/json"},
-                    timeout=15
-                )
-                res.raise_for_status()
-                
-                data = res.json().get("data", {})
-                session_data = data.get("session", {})
-                
-                if not session_data:
-                    LOGGER.warning("Session expired or not found")
-                    break
-                
-                mails = session_data.get("mails", [])
+                mails = _check_dropmail_me(BASE, token, session_id)
                 
                 for m in mails:
                     if m["id"] in seen:
@@ -705,12 +909,16 @@ def run_dropmail_me(poll: int = 5) -> None:
                         m.get("text", ""),
                         m,
                     )
-            except requests.RequestException as e:
-                LOGGER.warning(f"Network error during polling: {e}")
+            except APIError as e:
+                LOGGER.warning(f"API error during polling: {e}")
+                break  # Session expired, exit gracefully
+            except NetworkError as e:
+                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
             except Exception as e:
                 LOGGER.warning(f"Error during polling: {e}")
             
-            time.sleep(poll)
+            config = load_config()
+            _countdown_sleep(poll, config.get("display_mode", "rich"))
     except KeyboardInterrupt:
         console.print("[info]Stopped listening; goodbye![/]")
 
@@ -743,57 +951,99 @@ def print_ascii_banner() -> None:
     console.print("Developed by [link=https://github.com/zebbern]zebbern[/link]", style="cyan")
     console.print("─" * 80 + "\n")
 
-def interactive_menu() -> Tuple[str, int]:
-    """Display an interactive menu for provider selection."""
+def interactive_menu() -> Tuple[Optional[str], int]:
+    """Display an interactive menu for provider selection with failover support."""
     print_ascii_banner()
     
     config = load_config()
     default_provider = config.get("default_provider", "mail.tm")
     default_poll = config.get("poll_interval", 5)
     
-    # Display provider options
-    console.print("[header]Choose a temporary email provider:[/]")
+    while True:  # Loop to allow retry on provider failure
+        # Display provider options
+        console.print("[header]Choose a temporary email provider:[/]")
+        
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="cyan bold")
+        table.add_column()
+        
+        for idx, name in enumerate(PROVIDERS, 1):
+            default_marker = " [yellow](default)[/]" if name == default_provider else ""
+            table.add_row(f"{idx})", f"{name}{default_marker}")
+        
+        console.print(table)
+        
+        # Get provider selection
+        providers_list = list(PROVIDERS.keys())
+        default_index = providers_list.index(default_provider) if default_provider in providers_list else 0
+        
+        while True:
+            choice = console.input(f"[bold]Provider[/] [1-{len(PROVIDERS)}] [{default_index + 1}]: ")
+            choice = choice.strip() or str(default_index + 1)
+            
+            if choice.isdigit() and 1 <= int(choice) <= len(PROVIDERS):
+                provider = providers_list[int(choice) - 1]
+                break
+            console.print("[warning]Invalid selection. Please enter a number between " 
+                          f"1 and {len(PROVIDERS)}.[/]")
+        
+        # Get polling interval
+        while True:
+            poll_str = console.input(f"[bold]Polling interval[/] (seconds) [{default_poll}]: ")
+            poll_str = poll_str.strip() or str(default_poll)
+            
+            if poll_str.isdigit() and int(poll_str) > 0:
+                poll = int(poll_str)
+                break
+            console.print("[warning]Invalid polling interval. Please enter a positive number.[/]")
+        
+        # Save selections as defaults for next time
+        config["default_provider"] = provider
+        config["poll_interval"] = poll
+        save_config(config)
+        
+        # Try to run the provider
+        try:
+            # Print banner for the selected provider
+            print_ascii_banner()
+            
+            # Run the selected provider
+            if provider == "tempmail.lol":
+                run_tempmail_lol(poll=poll, rush=False)
+            else:
+                PROVIDERS[provider](poll=poll)
+            
+            # If we reach here, provider exited normally (e.g., KeyboardInterrupt)
+            return None, poll
+            
+        except (NetworkError, APIError) as e:
+            console.print(f"[warning]Provider {provider} failed: {e}[/]")
+            console.print("[warning]Try a different provider or press Ctrl+C to exit.[/]")
+            console.print()
+            # Loop continues to show menu again
+        except KeyboardInterrupt:
+            # User wants to exit
+            return None, poll
+
+def list_providers_table() -> None:
+    """Display a table of all available providers and exit."""
+    table = Table(title="Available Providers", show_header=True, header_style="bold cyan")
+    table.add_column("Provider", style="cyan")
+    table.add_column("Description", style="white")
     
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="cyan bold")
-    table.add_column()
+    providers_info = {
+        "guerrillamail": "Fast, reliable temporary email service",
+        "mail.tm": "Privacy-focused with JWT authentication",
+        "tempmail.lol": "Simple and quick temporary email",
+        "mail.gw": "Alternative to mail.tm with same API",
+        "dropmail.me": "GraphQL-based temporary email service"
+    }
     
-    for idx, name in enumerate(PROVIDERS, 1):
-        default_marker = " [yellow](default)[/]" if name == default_provider else ""
-        table.add_row(f"{idx})", f"{name}{default_marker}")
+    for provider in PROVIDERS.keys():
+        table.add_row(provider, providers_info.get(provider, "Temporary email provider"))
     
     console.print(table)
-    
-    # Get provider selection
-    providers_list = list(PROVIDERS.keys())
-    default_index = providers_list.index(default_provider) if default_provider in providers_list else 0
-    
-    while True:
-        choice = console.input(f"[bold]Provider[/] [1-{len(PROVIDERS)}] [{default_index + 1}]: ")
-        choice = choice.strip() or str(default_index + 1)
-        
-        if choice.isdigit() and 1 <= int(choice) <= len(PROVIDERS):
-            provider = providers_list[int(choice) - 1]
-            break
-        console.print("[warning]Invalid selection. Please enter a number between " 
-                      f"1 and {len(PROVIDERS)}.[/]")
-    
-    # Get polling interval
-    while True:
-        poll_str = console.input(f"[bold]Polling interval[/] (seconds) [{default_poll}]: ")
-        poll_str = poll_str.strip() or str(default_poll)
-        
-        if poll_str.isdigit() and int(poll_str) > 0:
-            poll = int(poll_str)
-            break
-        console.print("[warning]Invalid polling interval. Please enter a positive number.[/]")
-    
-    # Save selections as defaults for next time
-    config["default_provider"] = provider
-    config["poll_interval"] = poll
-    save_config(config)
-    
-    return provider, poll
+    sys.exit(0)
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments."""
@@ -831,12 +1081,60 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Don't save received messages to history.",
     )
     parser.add_argument(
+        "--list-providers", "-l",
+        action="store_true",
+        help="List all available providers and exit.",
+    )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="View email history and exit.",
+    )
+    parser.add_argument(
+        "--clear-history",
+        action="store_true",
+        help="Clear email history and exit.",
+    )
+    parser.add_argument(
+        "--export",
+        type=str,
+        metavar="FILE",
+        nargs="?",
+        const="email_export.json",
+        help="Export emails to JSON file (default: email_export.json) and exit.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode with detailed error messages.",
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
-        version="Temp Mail Watcher v2.0 by zebbern (https://github.com/zebbern)",
+        version="Temp Mail Watcher v2.1.0 by zebbern (https://github.com/zebbern)",
     )
     
     args = parser.parse_args(argv)
+    
+    # Handle mutually exclusive flags that exit immediately
+    if args.list_providers:
+        list_providers_table()
+    
+    if args.history:
+        view_history()
+        sys.exit(0)
+    
+    if args.clear_history:
+        clear_history()
+        sys.exit(0)
+    
+    if args.export:
+        export_emails(args.export)
+        sys.exit(0)
+    
+    # Set logging level based on debug flag
+    if args.debug:
+        LOGGER.setLevel(logging.DEBUG)
     
     # Update config with CLI options
     config["poll_interval"] = args.poll
@@ -846,8 +1144,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     
     return args
 
+def signal_handler(signum, frame):
+    """Handle SIGTERM signal gracefully."""
+    console.print("\n[info]Received SIGTERM. Goodbye![/]")
+    sys.exit(0)
+
 def main() -> None:
     """Main entry point for the application."""
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     try:
         # Clear the screen
         clear_screen()
@@ -858,6 +1164,10 @@ def main() -> None:
         # If no provider specified, show interactive menu
         if not args.provider:
             provider_name, poll_interval = interactive_menu()
+            # If interactive menu returns None, user exited
+            if provider_name is None:
+                console.print("[info]Goodbye![/]")
+                sys.exit(0)
         else:
             provider_name = args.provider
             poll_interval = args.poll
@@ -885,7 +1195,7 @@ def main() -> None:
     except Exception as e:
         LOGGER.error(f"Unexpected error: {e}")
         console.print(f"[error]An unexpected error occurred: {e}[/]")
-        if os.environ.get("DEBUG"):
+        if args.debug:
             console.print_exception()
         sys.exit(1)
 
