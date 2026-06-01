@@ -28,7 +28,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/zebbern/cli-temp-mails.git tempmail
+git clone https://github.com/vinayakkumar9000/TEMPMAIL-CLI.git
 cd tempmail
 
 # Run the installer (works on all platforms)
