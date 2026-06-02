@@ -134,7 +134,7 @@ def load_config() -> Dict[str, Any]:
         fixed.append("display_mode")
     
     # Validate default_provider
-    valid_providers = ["guerrillamail", "mail.tm", "tempmail.lol", "mail.gw", "dropmail.me"]
+    valid_providers = ["guerrillamail", "mail.tm"]
     if config.get("default_provider") not in valid_providers:
         config["default_provider"] = defaults["default_provider"]
         fixed.append("default_provider")
@@ -586,341 +586,7 @@ def run_mail_tm(poll: int = 5) -> None:
     except KeyboardInterrupt:
         console.print("[info]Stopped listening; goodbye![/]")
 
-##############################################################################
-# Provider 3 – tempmail.lol
-##############################################################################
 
-@retry_with_backoff()
-def _setup_tempmail_lol(BASE, rush):
-    """Setup tempmail.lol account with retry logic."""
-    endpoint = f"{BASE}/generate/rush" if rush else f"{BASE}/generate"
-    gen_res = requests.get(endpoint, timeout=15)
-    gen_res.raise_for_status()
-    data = gen_res.json()
-    return data["address"], data["token"]
-
-@retry_with_backoff()
-def _check_tempmail_lol(BASE, token):
-    """Check tempmail.lol inbox with retry logic."""
-    inbox_res = requests.get(f"{BASE}/auth/{token}", timeout=15)
-    inbox_res.raise_for_status()
-    return inbox_res.json().get("email", [])
-
-def run_tempmail_lol(poll: int = 5, rush: bool = False) -> None:
-    """Run the tempmail.lol provider listener."""
-    BASE = "https://api.tempmail.lol"
-    
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]Setting up tempmail.lol account..."),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("setup", total=None)
-        
-        try:
-            address, token = _setup_tempmail_lol(BASE, rush)
-        except (NetworkError, APIError) as e:
-            raise
-        except requests.RequestException as e:
-            raise NetworkError(f"Network error: {e}") from e
-        except Exception as e:
-            raise APIError(f"API error: {e}") from e
-    
-    console.print(f"[success]✓[/] Email address ready: [bold]{address}[/]")
-    console.print(f"Polling every [bold]{poll}s[/] for new messages. Press [bold]Ctrl+C[/] to stop.\n")
-    
-    seen: Set[str] = set()
-    try:
-        while True:
-            try:
-                msgs = _check_tempmail_lol(BASE, token)
-                
-                for m in msgs:
-                    # Create a message ID using SHA256 hash for better deduplication
-                    msg_content = f"{m.get('from', '')}{m.get('subject', '')}{m.get('body', '')}"
-                    msg_id = hashlib.sha256(msg_content.encode()).hexdigest()[:16]
-                    
-                    if msg_id in seen:
-                        continue
-                    
-                    seen.add(msg_id)
-                    
-                    print_email(
-                        "tempmail.lol",
-                        address,
-                        m.get("from"),
-                        m.get("subject"),
-                        None,  # No date provided by this API
-                        m.get("body", ""),
-                        m,
-                    )
-            except NetworkError as e:
-                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
-            except Exception as e:
-                LOGGER.warning(f"Error during polling: {e}")
-            
-            config = load_config()
-            _countdown_sleep(poll, config.get("display_mode", "rich"))
-    except KeyboardInterrupt:
-        console.print("[info]Stopped listening; goodbye![/]")
-
-##############################################################################
-# Provider 4 – mail.gw (identical API to mail.tm, hosted elsewhere)
-##############################################################################
-
-@retry_with_backoff()
-def _setup_mail_gw(BASE):
-    """Setup mail.gw account with retry logic."""
-    # Get available domains
-    domains_res = requests.get(f"{BASE}/domains?page=1", timeout=15)
-    domains_res.raise_for_status()
-    domain = domains_res.json()["hydra:member"][0]["domain"]
-    
-    # Create random account
-    address = f"{_rand_string()}@{domain}"
-    password = _rand_string(12)
-    
-    account_res = requests.post(
-        f"{BASE}/accounts", 
-        json={"address": address, "password": password},
-        timeout=15
-    )
-    account_res.raise_for_status()
-    
-    # Get authentication token
-    token_res = requests.post(
-        f"{BASE}/token", 
-        json={"address": address, "password": password},
-        timeout=15
-    )
-    token_res.raise_for_status()
-    auth = token_res.json()["token"]
-    
-    return address, password, auth
-
-@retry_with_backoff()
-def _authenticate_mail_gw(BASE, address, password):
-    """Re-authenticate with mail.gw (for token refresh)."""
-    token_res = requests.post(
-        f"{BASE}/token", 
-        json={"address": address, "password": password},
-        timeout=15
-    )
-    token_res.raise_for_status()
-    return token_res.json()["token"]
-
-@retry_with_backoff()
-def _check_mail_gw(BASE, headers):
-    """Check mail.gw inbox with retry logic."""
-    inbox_res = requests.get(f"{BASE}/messages", headers=headers, timeout=15)
-    inbox_res.raise_for_status()
-    return inbox_res.json()["hydra:member"]
-
-@retry_with_backoff()
-def _fetch_mail_gw(BASE, headers, message_id):
-    """Fetch full mail.gw message with retry logic."""
-    full_res = requests.get(f"{BASE}/messages/{message_id}", headers=headers, timeout=15)
-    full_res.raise_for_status()
-    return full_res.json()
-
-def run_mail_gw(poll: int = 5) -> None:
-    """Run the mail.gw provider listener."""
-    BASE = "https://api.mail.gw"
-    
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]Setting up mail.gw account..."),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("setup", total=None)
-        
-        try:
-            address, password, auth = _setup_mail_gw(BASE)
-            headers = {"Authorization": f"Bearer {auth}"}
-        except (NetworkError, APIError) as e:
-            raise
-        except requests.RequestException as e:
-            raise NetworkError(f"Network error: {e}") from e
-        except Exception as e:
-            raise APIError(f"API error: {e}") from e
-    
-    console.print(f"[success]✓[/] Email address ready: [bold]{address}[/]")
-    console.print(f"Polling every [bold]{poll}s[/] for new messages. Press [bold]Ctrl+C[/] to stop.\n")
-    
-    seen: Set[str] = set()
-    try:
-        while True:
-            try:
-                inbox = _check_mail_gw(BASE, headers)
-                
-                for m in inbox:
-                    if m["id"] in seen:
-                        continue
-                    
-                    seen.add(m["id"])
-                    
-                    full = _fetch_mail_gw(BASE, headers, m["id"])
-                    
-                    print_email(
-                        "mail.gw",
-                        address,
-                        full.get("from", {}).get("address"),
-                        full.get("subject"),
-                        full.get("createdAt"),
-                        full.get("text", ""),
-                        full,
-                    )
-            except requests.HTTPError as e:
-                # Handle 401 (token expired) - re-authenticate
-                if e.response is not None and e.response.status_code == 401:
-                    try:
-                        console.print("[info]Re-authenticated with mail.gw[/]")
-                        auth = _authenticate_mail_gw(BASE, address, password)
-                        headers = {"Authorization": f"Bearer {auth}"}
-                    except Exception as reauth_error:
-                        LOGGER.warning(f"Failed to re-authenticate: {reauth_error}")
-                else:
-                    LOGGER.warning(f"HTTP error during polling: {e}")
-            except NetworkError as e:
-                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
-            except Exception as e:
-                LOGGER.warning(f"Error during polling: {e}")
-            
-            config = load_config()
-            _countdown_sleep(poll, config.get("display_mode", "rich"))
-    except KeyboardInterrupt:
-        console.print("[info]Stopped listening; goodbye![/]")
-
-##############################################################################
-# Provider 5 – dropmail.me
-##############################################################################
-
-@retry_with_backoff()
-def _setup_dropmail_me(BASE, token):
-    """Setup dropmail.me account with retry logic."""
-    query = """
-    mutation {
-      introduceSession {
-        id
-        expiresAt
-        addresses {
-          address
-        }
-      }
-    }
-    """
-    
-    res = requests.post(
-        f"{BASE}/{token}",
-        json={"query": query},
-        headers={"Content-Type": "application/json"},
-        timeout=15
-    )
-    res.raise_for_status()
-    
-    data = res.json().get("data", {})
-    session = data.get("introduceSession", {})
-    session_id = session.get("id")
-    address = session.get("addresses", [{}])[0].get("address")
-    
-    if not session_id or not address:
-        raise APIError("Failed to get valid session or address")
-    
-    return session_id, address
-
-@retry_with_backoff()
-def _check_dropmail_me(BASE, token, session_id):
-    """Check dropmail.me inbox with retry logic."""
-    query = """
-    query($id: ID!){
-      session(id: $id){
-        mails{
-          id
-          fromAddr
-          headerSubject
-          text
-          receivedAt
-        }
-      }
-    }
-    """
-    
-    res = requests.post(
-        f"{BASE}/{token}",
-        json={"query": query, "variables": {"id": session_id}},
-        headers={"Content-Type": "application/json"},
-        timeout=15
-    )
-    res.raise_for_status()
-    
-    data = res.json().get("data", {})
-    session_data = data.get("session", {})
-    
-    if not session_data:
-        raise APIError("Session expired or not found")
-    
-    return session_data.get("mails", [])
-
-def run_dropmail_me(poll: int = 5) -> None:
-    """Run the dropmail.me provider listener."""
-    BASE = "https://dropmail.me/api/graphql"
-    
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]Setting up dropmail.me account..."),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("setup", total=None)
-        
-        try:
-            token = _rand_string(12)
-            session_id, address = _setup_dropmail_me(BASE, token)
-        except (NetworkError, APIError) as e:
-            raise
-        except requests.RequestException as e:
-            raise NetworkError(f"Network error: {e}") from e
-        except Exception as e:
-            raise APIError(f"API error: {e}") from e
-    
-    console.print(f"[success]✓[/] Email address ready: [bold]{address}[/]")
-    console.print(f"Polling every [bold]{poll}s[/] for new messages. Press [bold]Ctrl+C[/] to stop.\n")
-    
-    seen: Set[str] = set()
-    try:
-        while True:
-            try:
-                mails = _check_dropmail_me(BASE, token, session_id)
-                
-                for m in mails:
-                    if m["id"] in seen:
-                        continue
-                    
-                    seen.add(m["id"])
-                    
-                    print_email(
-                        "dropmail.me",
-                        address,
-                        m.get("fromAddr"),
-                        m.get("headerSubject"),
-                        m.get("receivedAt"),
-                        m.get("text", ""),
-                        m,
-                    )
-            except APIError as e:
-                LOGGER.warning(f"API error during polling: {e}")
-                break  # Session expired, exit gracefully
-            except NetworkError as e:
-                LOGGER.warning(f"Network error during polling (all retries exhausted): {e}")
-            except Exception as e:
-                LOGGER.warning(f"Error during polling: {e}")
-            
-            config = load_config()
-            _countdown_sleep(poll, config.get("display_mode", "rich"))
-    except KeyboardInterrupt:
-        console.print("[info]Stopped listening; goodbye![/]")
 
 ##############################################################################
 # CLI - argument parsing, interactive menu, dispatcher
@@ -929,9 +595,6 @@ def run_dropmail_me(poll: int = 5) -> None:
 PROVIDERS: Dict[str, Callable[[int], None]] = {
     "guerrillamail": run_guerrillamail,
     "mail.tm": run_mail_tm,
-    "tempmail.lol": run_tempmail_lol,
-    "mail.gw": run_mail_gw,
-    "dropmail.me": run_dropmail_me,
 }
 
 def print_ascii_banner() -> None:
@@ -940,12 +603,12 @@ def print_ascii_banner() -> None:
     clear_screen()
     
     banner = r"""
- _____                   __  __       _ _    __        __    _       _               
-|_   _|__ _ __ ___  _ __|  \/  | __ _(_) |   \ \      / /_ _| |_ ___| |__   ___ _ __ 
-  | |/ _ \ '_ ` _ \| '_ \ |\/| |/ _` | | |____\ \ /\ / / _` | __/ __| '_ \ / _ \ '__|
-  | |  __/ | | | | | |_) | |  | | (_| | | |_____\ V  V / (_| | || (__| | | |  __/ |   
-  |_|\___|_| |_| |_| .__/|_|  |_|\__,_|_|_|      \_/\_/ \__,_|\__\___|_| |_|\___|_|   
-                   |_|                                                               
+ _____                   __  __       _ _ 
+|_   _|__ _ __ ___  _ __|  \/  | __ _(_) |
+  | |/ _ \ '_ ` _ \| '_ \ |\/| |/ _` | | |
+  | |  __/ | | | | | |_) | |  | | (_| | | |
+  |_|\___|_| |_| |_| .__/|_|  |_|\__,_|_|_|
+                   |_|                     
     """
     console.print(banner, style="bold cyan")
     console.print("Developed by [link=https://github.com/zebbern]zebbern[/link]", style="cyan")
@@ -1008,10 +671,7 @@ def interactive_menu() -> Tuple[Optional[str], int]:
             print_ascii_banner()
             
             # Run the selected provider
-            if provider == "tempmail.lol":
-                run_tempmail_lol(poll=poll, rush=False)
-            else:
-                PROVIDERS[provider](poll=poll)
+            PROVIDERS[provider](poll=poll)
             
             # If we reach here, provider exited normally (e.g., KeyboardInterrupt)
             return None, poll
@@ -1034,9 +694,6 @@ def list_providers_table() -> None:
     providers_info = {
         "guerrillamail": "Fast, reliable temporary email service",
         "mail.tm": "Privacy-focused with JWT authentication",
-        "tempmail.lol": "Simple and quick temporary email",
-        "mail.gw": "Alternative to mail.tm with same API",
-        "dropmail.me": "GraphQL-based temporary email service"
     }
     
     for provider in PROVIDERS.keys():
@@ -1064,11 +721,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=config.get("poll_interval", 5),
         help=f"Polling interval in seconds (default: {config.get('poll_interval', 5)}).",
     )
-    parser.add_argument(
-        "--rush", "-r",
-        action="store_true",
-        help="Use rush mode for tempmail.lol (faster address generation).",
-    )
+
     parser.add_argument(
         "--display", "-d",
         choices=["rich", "plain"],
@@ -1111,7 +764,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--version", "-v",
         action="version",
-        version="Temp Mail Watcher v2.1.0 by zebbern (https://github.com/zebbern)",
+        version="Temp Mail v2.2.0 by zebbern (https://github.com/zebbern)",
     )
     
     args = parser.parse_args(argv)
@@ -1177,10 +830,7 @@ def main() -> None:
             print_ascii_banner()
         
         # Run the selected provider
-        if provider_name == "tempmail.lol" and args.rush:
-            run_tempmail_lol(poll=poll_interval, rush=True)
-        else:
-            PROVIDERS[provider_name](poll=poll_interval)
+        PROVIDERS[provider_name](poll=poll_interval)
     except NetworkError as e:
         LOGGER.error(f"Network error: {e}")
         console.print("[error]Failed to connect to the service. Please check your internet connection.[/]")

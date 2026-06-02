@@ -1,4 +1,4 @@
-<h2 align="center">TempMail Watcher</h2> 
+<h2 align="center">Temp Mail</h2> 
 
 <div align="center">
 
@@ -14,10 +14,10 @@
 
 ## Features
 
-- **Multiple Service Support** - Works with GuerrillaMail, mail.tm, tempmail.lol, mail.gw, and dropmail.me
+- **Multiple Service Support** - Works with GuerrillaMail and mail.tm
 - **Rich Terminal UI** - Beautiful, colorful display with clear message formatting
 - **Robust Retry Logic** - Automatic exponential backoff on network errors
-- **Session Keepalive** - Automatic JWT token refresh for mail.tm and mail.gw
+- **Session Keepalive** - Automatic JWT token refresh for mail.tm
 - **Message History** - Save and review past messages
 - **Configuration System** - Save your preferences between sessions
 - **Cross-Platform** - Works on Windows, macOS, and Linux
@@ -79,9 +79,6 @@ python tempmail.py --poll 10 guerrillamail
 ### Advanced Options
 
 ```bash
-# Use rush mode for tempmail.lol (faster address generation)
-python tempmail.py tempmail.lol --rush
-
 # Use plain text display mode
 python tempmail.py --display plain
 
@@ -101,7 +98,6 @@ python tempmail.py --help
 |------|-------|-------------|---------|
 | `provider` | - | Provider to use (optional, shows menu if omitted) | `python tempmail.py mail.tm` |
 | `--poll` | `-p` | Polling interval in seconds (default: 5) | `--poll 10` |
-| `--rush` | `-r` | Use rush mode for tempmail.lol (faster) | `--rush` |
 | `--display` | `-d` | Display mode: `rich` or `plain` (default: rich) | `--display plain` |
 | `--no-save` | `-n` | Don't save messages to history | `--no-save` |
 | `--list-providers` | `-l` | List all available providers and exit | `--list-providers` |
@@ -117,14 +113,11 @@ python tempmail.py --help
 | Provider | Features | Notes |
 |----------|----------|-------|
 | mail.tm | Full body text, HTML support, JWT auth | Fast, reliable with auto token refresh |
-| mail.gw | Full body text, HTML support, JWT auth | Alternative to mail.tm with auto token refresh |
 | GuerrillaMail | Text & HTML, attachments | Well-established service |
-| tempmail.lol | Basic text messages | Fast with rush option, SHA256 deduplication |
-| dropmail.me | Text & HTML messages | GraphQL API |
 
 ## Configuration
 
-TempMail Watcher saves your preferences in `~/.config/tempmail-watcher/config.json`. Settings include:
+Temp Mail saves your preferences in `~/.config/tempmail-watcher/config.json`. Settings include:
 
 - **default_provider** - Your preferred provider (default: mail.tm)
 - **poll_interval** - Seconds between checks (default: 5, min: 1)
@@ -160,7 +153,7 @@ python tempmail.py --clear-history
 ## Robustness Features
 
 - **Automatic Retry Logic** - All HTTP requests retry up to 3 times with exponential backoff (2s, 4s, 8s)
-- **Session Keepalive** - JWT tokens for mail.tm and mail.gw are automatically refreshed on 401 errors
+- **Session Keepalive** - JWT tokens for mail.tm are automatically refreshed on 401 errors
 - **Graceful Failover** - In interactive mode, failed providers return to menu instead of crashing
 - **Signal Handling** - Clean exit on SIGTERM and Ctrl+C
 - **Config Validation** - Invalid config values are automatically corrected on startup
@@ -168,7 +161,7 @@ python tempmail.py --clear-history
 
 ## Version
 
-Current version: **v2.1.0**
+Current version: **v2.2.0**
 
 ---
 
